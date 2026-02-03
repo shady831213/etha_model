@@ -1,0 +1,47 @@
+[package]
+name = "etha_model"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "etha_model"
+crate-type = ["staticlib", "cdylib", "rlib",]
+
+
+[dependencies]
+smoltcp = "0.8"
+pcap-parser = "0.14"
+ipsec-parser = "0.7"
+array-init = "2.0"
+bitfield = "0.14"
+tracing = "0.1"
+tracing-subscriber = {version = "0.3", features = ["env-filter", "fmt", "json"]}
+tracing-appender = "0.2"
+tracing-chrome = "0.7.0"
+etha_model_generator = {path = "generator"}
+clap = "2"
+aes-gcm = "0.10.1"
+ccm = "0.5.0"
+aes = "0.8.2"
+cbc = {version = "0.1.2", features=["std", "block-padding"]}
+hmac = "0.12.1"
+sha1 = "0.10.5"
+sha2 = "0.10.6"
+core_affinity = "0.8.0"
+
+[dev-dependencies]
+test-log = {version = "0.2.11", default-features = false, features=["trace"]}
+terminus-spaceport={git = "https://github.com/shady831213/terminus_spaceport"}
+hex-literal = "0.3"
+
+[build-dependencies]
+cc = "1.0"
+
+[profile.release-lto]
+inherits = "release"
+lto = true
+
+[features]
+rohc=[]
