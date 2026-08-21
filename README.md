@@ -1,168 +1,265 @@
-# ehta_model
-A ethernet accelerator functional model written in Rust.
-A example to show hwo modeling hardware in rust, exploreing hardware device architecture, sw/hw partition,  defineing registers interface and dma descirptors structure..
+# etha_model
 
-# How to run
+A **Rust-based functional model for exploring Ethernet/network accelerator architecture and hardware/software interfaces**.
 
-## Build model
+`etha_model` is not intended to be a cycle-accurate hardware simulator. It is an executable device model for experimenting with the architecture contract between accelerator hardware and software: register maps, DMA descriptors, queue/ring organization, interrupts, datapath structure, filtering/dispatch, crypto offload, and observability.
+
+The project is also an experiment in using **Rust as the source of truth for both model-side semantics and generated software-visible interfaces**.
+
+## What it models
+
+- Up to 16 RX/TX queue pairs
+- RX packet parsing for Ethernet / IP / TCP / UDP
+- EtherType and 5-tuple filtering
+- RX dispatch into software-visible rings
+- TX queue arbitration
+- DMA-style descriptors and queue state
+- Interrupt delivery
+- PCAP, TAP, raw-socket and loopback MAC backends
+- Standalone IPsec crypto acceleration
+- Optional ROHC compression/decompression
+- Chrome Trace based model observability
+- C FFI and generated C headers
+
+## Architecture
+
+```mermaid
+flowchart TD
+    SW["C Driver / Test Software"]
+    REG["Register Interface"]
+    DESC["DMA Descriptors / Rings"]
+    IRQ["Interrupts"]
+
+    RX["RX Datapath"]
+    PARSE["L2 / L3 / L4 Parser"]
+    FILTER["Filters"]
+    DISP["Dispatcher"]
+
+    TX["TX Datapath"]
+    SEQ["TX Sequencer"]
+    ARB["Arbiter"]
+
+    CORE["EthaCore"]
+    MAC["MAC Backend\nPCAP / TAP / raw / loopback"]
+
+    SW --> REG
+    SW --> DESC
+    REG --> CORE
+    DESC --> CORE
+
+    MAC --> RX
+    RX --> PARSE --> FILTER --> DISP
+    DISP --> DESC
+
+    DESC --> TX
+    TX --> SEQ --> ARB --> MAC
+
+    CORE --> IRQ --> SW
 ```
+
+The RX pipeline is explicitly composed from independent stages:
+
+```text
+packet input
+    ↓
+L2/L3/L4 parsing
+    ↓
+filtering
+    ↓
+dispatch
+    ↓
+RX descriptor/ring
+```
+
+The model has explicit `Blocking`, `Dropped`, and parse-error semantics so pipeline stages can represent backpressure/stall behavior rather than behaving as a single monolithic packet-processing function.
+
+## Hardware/software contract
+
+A major part of the project is modeling the interface visible to firmware/driver software.
+
+The register space is divided into RX, queue, and global regions, with per-channel RX/TX ring registers. Queue configuration, producer/consumer state, interrupts, filters, and enable/control state are represented through the same model used by the functional datapath.
+
+### Single-source register and descriptor definitions
+
+`etha_model` contains custom Rust procedural macros for register maps and descriptor layouts.
+
+The model definitions describe things such as:
+
+- bit positions and field widths
+- access policy
+- enums
+- packed descriptor layouts
+- explicit padding/layout constraints
+
+From those Rust definitions the project can generate **C headers** for software clients. This keeps the executable model and the software-visible ABI derived from the same structured definition instead of maintaining independent register/descriptor descriptions by hand.
+
+For example, RX result descriptors include frame metadata plus parsed L2/L3/L4 information and status fields in a fixed layout.
+
+Generate headers with:
+
+```bash
+cargo run --bin header_gen -- [OPTIONS] <OUT_DIR>
+```
+
+## IPsec accelerator
+
+The repository also contains a standalone IPsec/crypto accelerator model with its own queues, descriptors, register interface, engine pipeline, and session cache.
+
+Supported primitives include:
+
+- AES-128 / AES-256
+- GCM / CCM / CBC / GMAC / CBC-MAC
+- SHA1-HMAC / SHA256-HMAC / SHA512_256-HMAC
+- up to 4 queues
+- up to 64 security sessions
+- key caching
+
+This part of the project is useful for exploring the same HW/SW-interface ideas beyond the Ethernet datapath itself.
+
+## ROHC
+
+With the optional `rohc` feature, the model integrates the ROHC library for compression/decompression.
+
+Supported profiles include:
+
+- `ROHC_PROFILE_RTP`
+- `ROHC_PROFILE_UDP`
+- `ROHCv2_PROFILE_IP_UDP_RTP`
+- `ROHCv2_PROFILE_IP_UDP`
+
+## Observability and tracing
+
+The model can emit Chrome Trace compatible JSON through Rust's `tracing` ecosystem.
+
+Enable tracing from the C-facing API:
+
+```c
+etha_logger_en(ETHA_LOGGER_FULL);
+/* run workload */
+etha_logger_dis();
+```
+
+The output is written to `model.trace.json` and can be opened with Chrome/Chromium tracing tools.
+
+A Python helper is included for post-processing:
+
+```bash
+python3 python/tracing_parser.py model.trace.json
+```
+
+It can summarize model activity such as:
+
+- register reads/writes
+- descriptor reads/writes
+- data read/write traffic
+- bus activity windows
+- event counts and byte counts
+
+**Note:** throughput values derived from trace timestamps describe model execution/activity unless an explicit hardware timing model is attached; they should not be interpreted as silicon performance estimates.
+
+## Build
+
+```bash
 cargo build --profile release-lto --lib
 ```
 
-## Build model with rohc
-rohc library is a dependency of model with rohc, so rohc library (as a submodule) must be installed. refer to [rohc](https://github.com/didier-barvaux/rohc/blob/master/INSTALL.md).
-And the configure could be with '--enable-static ' option.
-```
-$ ./configure --prefix=/path/to/installation/directory [--enable-static]
-$ make all
-$ make install
-```
-```
-cargo build --profile release-lto --lib --features='rohc'
+The crate exposes `staticlib`, `cdylib`, and `rlib` outputs so the model can be embedded from Rust or C environments.
+
+### Build with ROHC
+
+ROHC is an optional external dependency. Build/install the ROHC library first, then:
+
+```bash
+cargo build --profile release-lto --lib --features="rohc"
 ```
 
-### Update rohc lib binding
-```
+To regenerate the ROHC Rust bindings:
+
+```bash
 cd rohc_bindgen
-CLANG_PATH={CLANG_PATH} LIBCLANG_PATH={LIBCLANG_PATH} cargo run -- {ROHC_HEADERS_DIR} {OUTPUT_PATH}
+CLANG_PATH={CLANG_PATH} LIBCLANG_PATH={LIBCLANG_PATH} \
+  cargo run -- {ROHC_HEADERS_DIR} {OUTPUT_PATH}
 ```
 
+## Examples
 
-## run c example
-```
-// etha example
+Ethernet accelerator:
+
+```bash
 cargo build --profile release-lto --lib
-cd exmaples/etha
+cd examples/etha
 make
 ./example.exe
 ```
 
-```
-// ipsec example
+IPsec accelerator:
+
+```bash
 cargo build --profile release-lto --lib
-cd exmaples/etha_ipsec
+cd examples/etha_ipsec
 make
 ./example.exe
 ```
 
-```
-// rohc example
-cargo build --profile release-lto --lib --features='rohc'
-cd exmaples/rohc
+ROHC:
+
+```bash
+cargo build --profile release-lto --lib --features="rohc"
+cd examples/rohc
 make
 ./example.exe
 ```
 
-## model unit tests
-```
+## Tests
+
+```bash
 cargo test
 ```
 
-## model unit tests with rohc
-```
-cargo test --features='rohc'
+With ROHC:
+
+```bash
+cargo test --features="rohc"
 ```
 
-## header_generation
-```
-cargo run --bin header_gen -- [Options] <OUT_DIR>
-//help
-cargo run --bin header_gen -- -h
+## Project layout
+
+```text
+src/
+├── etha/            Ethernet accelerator model
+│   ├── desc/        RX/TX descriptors
+│   ├── reg_if/      software-visible register interface
+│   ├── *_parser.rs  packet parsing stages
+│   ├── rx_*         RX datapath/filter/dispatch
+│   └── tx_*         TX datapath/sequencing
+├── etha_ipsec/      standalone IPsec/crypto accelerator
+├── mac/             PCAP/TAP/raw/loopback backends
+├── reg_if/          reusable register/ring infrastructure
+├── irq.rs           interrupt infrastructure
+└── logger.rs        tracing/observability
+
+generator/
+└── proc_macros/     register/descriptor DSL and C-header generation
 ```
 
-## tracing & analysis
-### Enable tracing
-To enable tracing, please add the following functions.Also can refer to [this example](examples/etha/example.c)
-```
-...
-    //enable env logger, use envvar RUST_LOG
-    //enable tracing logger for all event
-    etha_logger_en(ETHA_LOGGER_FULL);
-...
-...
-...
-    //disable logger and flush all result
-    etha_logger_dis();
-```
-### Tracing result
-The tracing result is located in 'model.trace.json' in current working dir. It is in [chrome tracing](https://www.chromium.org/developers/how-tos/trace-event-profiling-tool/) format. Something like:
+## Why this project exists
 
-```
-[
-{"ph":"M","pid":1,"name":"thread_name","tid":0,"args":{"name":"0"}},
-{"ph":"i","pid":1,"ts":842.365,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2093","data":"1024"}},
-{"ph":"i","pid":1,"ts":916.437,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2080","data":"40616128"}},
-{"ph":"i","pid":1,"ts":923.176,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2081","data":"0"}},
-{"ph":"i","pid":1,"ts":925.246,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2082","data":"40662656"}},
-{"ph":"i","pid":1,"ts":927.665,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2083","data":"0"}},
-{"ph":"i","pid":1,"ts":931.024,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2084","data":"10"}},
-{"ph":"i","pid":1,"ts":935.71,"name":"event src/etha/ffi.rs:131","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg write\"","addr":"2092","data":"1"}},
-{"ph":"i","pid":1,"ts":945.142,"name":"event src/etha/ffi.rs:147","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg read\"","addr":"2087","data":"0"}},
-{"ph":"i","pid":1,"ts":946.656,"name":"event src/etha/ffi.rs:147","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg read\"","addr":"2088","data":"0"}},
-{"ph":"i","pid":1,"ts":954.042,"name":"event src/etha/ffi.rs:147","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg read\"","addr":"2088","data":"0"}},
-{"ph":"i","pid":1,"ts":955.524,"name":"event src/etha/ffi.rs:147","cat":"etha","tid":0,"s":"t","args":{"name":"\"reg read\"","addr":"2088","data":"0"}},
-...
+`etha_model` is mainly an experiment in **hardware architecture modeling and HW/SW co-design**:
+
+```text
+architecture idea
+      ↓
+registers / queues / descriptors
+      ↓
+executable functional model
+      ↓
+software-visible C interface
+      ↓
+tests / tracing / analysis
 ```
 
-### Analysis Tracing result
-The result can be visualized in a Chromium/Chrome browser with 'chrome://tracing/'
+The interesting part is not Ethernet alone; it is exploring how a hardware accelerator can be specified, modeled, driven by software, and instrumented as one coherent system.
 
-And there is a python module [tracing_parser.py](python/tracing_parser.py) to help collecting results into python objects to analysis further. This module is executable as a simple demo to summarize some infomations.
-```
-python3 python/tracing_parser.py {tracing result file}
-```
-Then it will output something like this
-```
-------------etha summary begin------------
-etha.reg_reads = 187
-etha.reg_writes = 67
-etha.bus_rd_start_time = 1257.792 us
-etha.bus_rd_end_time = 2800.381 us
-etha.bus_wr_start_time = 1266.478 us
-etha.bus_wr_end_time = 2803.799 us
-etha.desc_read_cnt = 72
-etha.desc_read_bytes = 1440
-etha.desc_write_cnt = 21
-etha.desc_write_bytes = 2568
-etha.data_read_cnt = 36
-etha.data_read_bytes = 27940
-etha.data_write_cnt = 36
-etha.data_write_bytes = 27940
-etha.sc_read_cnt = 0
-etha.sc_read_bytes = 0
-etha.bus_rd_period = 1542.589 us
-etha.bus_wr_period = 1537.321 us
-etha.data_rd_throughput = 18112407.12853521 bytes/s
-etha.data_wr_throughput = 18174473.64603749 bytes/s
-etha.bus_read_cnt = 108
-etha.bus_read_bytes = 29380
-etha.bus_write_cnt = 57
-etha.bus_write_bytes = 30508
-etha.bus_wr_throughput = 19844912.02553013 bytes/s
-etha.bus_rd_throughput = 19111168.064444575 bytes/s
-------------etha summary end------------
-```
+## License
 
-# featurs
-- [x] up to 16 rx and tx rings
-- [x] rx and tx from/into pcap files
-- [x] etype filters and 5-tuples filters
-- [x] parse ethernet/ip/tcp/upd for ingress package
-- [x] round-robin arbiter for tx
-- [x] tap/raw_socket/loopback for rx and tx(need test in proper enviroment)
-- [x] descriptor header generation
-- [x] registers header generation
-- [x] add pcap_cmp() helper function to compare packages in 2 pcap files.
-- [x] support standalone ipsec crypto device.
-    - [x] aes-256, aes-128
-    - [x] gcm, ccm, cbc, gmac, cbc-mac
-    - [x] sha1-hmac, sha256-hmac, sha512_256-hmac,
-    - [x] up to 4 queues
-    - [x] up to 64 security sessions
-    - [x] key caches
-- [x] support irqs.
-- [x] tracing and analysis.
-- [x] support model thread affinity binding.
-- [x] support rohc.
-    - [x] compress, decompress
-    - [x] ROHC_PROFILE_RTP, ROHC_PROFILE_UDP, ROHCv2_PROFILE_IP_UDP_RTP, ROHCv2_PROFILE_IP_UDP
+See [LICENSE](LICENSE).
